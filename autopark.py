@@ -193,4 +193,225 @@ class AutoParkController:
             print("[AutoPark] WARNING: Camera missing. Autopark disabled.")
 
         # Model
-        self.model = ParkingPatternModelBinary(
+        self.model = ParkingPatternModelBinary()
+
+        # ---- Tunable parameters ----
+        self.APPROACH_DISTANCE = 40.0   # cm from row where we scan
+        self.FORWARD_SPEED = 900
+        self.PARK_SPEED = 600
+        self.TURN_SPEED = 800
+
+        self.MIN_FRONT_DIST_CM = 8.0    # hard stop if closer than this
+
+    # ---------- Utilities ----------
+
+    def stop(self):
+        self.car.set_motor_model(0, 0, 0, 0)
+
+    def _read_distance(self) -> Optional[float]:
+        if self.ultra is None:
+            return None
+        try:
+            return self.ultra.get_distance()
+        except Exception:
+            return None
+
+    def _too_close_front(self) -> bool:
+        d = self._read_distance()
+        if d is not None and d < self.MIN_FRONT_DIST_CM:
+            print(f"[AutoPark] FRONT TOO CLOSE: {d:.1f} cm -> STOP")
+            self.stop()
+            return True
+        return False
+
+    def drive_forward_until(self, target_cm: float, timeout: float = 6.0):
+        """
+        Drive forward until ultrasonic <= target_cm or timeout.
+        """
+        self.car.set_motor_model(
+            self.FORWARD_SPEED, self.FORWARD_SPEED,
+            self.FORWARD_SPEED, self.FORWARD_SPEED
+        )
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._too_close_front():
+                break
+            d = self._read_distance()
+            if d is not None and d <= target_cm:
+                break
+            time.sleep(0.02)
+        self.stop()
+
+    # ---------- Camera capture ----------
+
+    def _capture_frame(self) -> Optional[Image.Image]:
+        if self.camera is None or Image is None:
+            return None
+        try:
+            # lazy-start streaming once
+            if not getattr(self.camera, "_ap_streaming", False):
+                if hasattr(self.camera, "start_stream"):
+                    self.camera.start_stream()
+                setattr(self.camera, "_ap_streaming", True)
+                time.sleep(0.5)
+
+            frame = self.camera.get_frame() if hasattr(self.camera, "get_frame") else None
+            if not frame:
+                return None
+
+            return Image.open(io.BytesIO(frame)).convert("RGB")
+        except Exception as e:
+            print("[AutoPark] Error capturing frame:", e)
+            return None
+
+    def scan_spots(self) -> List[str]:
+        """
+        Capture one frame and classify 4 spots.
+        """
+        img = self._capture_frame()
+        if img is None:
+            print("[AutoPark] No frame captured; assuming all full.")
+            return ["full"] * 4
+        labels = self.model.predict_all(img)
+        return labels
+
+    # ---------- Spot selection & parking maneuver ----------
+
+    def _choose_spot(self, labels: List[str]) -> Optional[int]:
+        """
+        Choose the spot to park in.
+        Strategy: pick the first "empty" spot.
+        """
+        for i, lab in enumerate(labels):
+            if lab == "empty":
+                return i
+        return None
+
+    def _park_in_spot(self, index: int):
+        """
+        Simple scripted maneuver into chosen spot.
+
+        Assumes:
+        - Spots are laid out horizontally from left to right in the camera view.
+        - Car is centered in lane facing them.
+        - Spots are on the RIGHT side relative to car motion (tweak if needed).
+
+        You MUST tune these durations for your geometry.
+        """
+
+        print(f"[AutoPark] Parking into spot {index}")
+
+        # Step 1: slight forward adjustment based on which bay
+        base_time = 0.3
+        extra_per_spot = 0.25
+        forward_time = base_time + extra_per_spot * index
+
+        print(f"[AutoPark] Forward adjust: {forward_time:.2f}s")
+        self.car.set_motor_model(
+            self.PARK_SPEED, self.PARK_SPEED,
+            self.PARK_SPEED, self.PARK_SPEED
+        )
+        start = time.time()
+        while time.time() - start < forward_time:
+            if self._too_close_front():
+                break
+            time.sleep(0.02)
+        self.stop()
+
+        # Step 2: right-turn arc into the bay
+        # Slow right wheels, faster left wheels -> curve to right.
+        print("[AutoPark] Turning into bay...")
+        turn_time = 2.0  # tune per spot/geometry
+        start = time.time()
+        while time.time() - start < turn_time:
+            if self._too_close_front():
+                break
+            self.car.set_motor_model(
+                self.PARK_SPEED, self.PARK_SPEED,
+                int(0.5 * self.PARK_SPEED), int(0.5 * self.PARK_SPEED)
+            )
+            time.sleep(0.05)
+        self.stop()
+
+        # Step 3: final slow creep until near obstacle
+        print("[AutoPark] Final creep forward...")
+        max_creep = 3.0
+        start = time.time()
+        while time.time() - start < max_creep:
+            d = self._read_distance()
+            if d is not None and d <= self.MIN_FRONT_DIST_CM:
+                print(f"[AutoPark] Stop at front distance {d:.1f} cm")
+                break
+            self.car.set_motor_model(
+                self.PARK_SPEED, self.PARK_SPEED,
+                self.PARK_SPEED, self.PARK_SPEED
+            )
+            time.sleep(0.05)
+        self.stop()
+
+        print("[AutoPark] Parking complete (scripted).")
+
+    # ---------- Main run ----------
+
+    def run(self):
+        print("[AutoPark] Auto-park started.")
+
+        # Pre-flight checks
+        if self.ultra is None:
+            print("[AutoPark] ERROR: No ultrasonic. Aborting.")
+            self.cleanup()
+            return
+
+        if self.camera is None or not self.model.enabled or self.model.model is None:
+            print("[AutoPark] ERROR: Camera or model not ready. Aborting.")
+            self.cleanup()
+            return
+
+        try:
+            # 1) Drive to scan distance
+            print("[AutoPark] Approaching scan distance...")
+            self.drive_forward_until(self.APPROACH_DISTANCE)
+
+            if self._too_close_front():
+                print("[AutoPark] Too close before scan; abort.")
+                return
+
+            # 2) One scan of all 4 spots
+            labels = self.scan_spots()
+            print("[AutoPark] Spot labels:", labels)
+
+            # 3) Check if any empty
+            spot_index = self._choose_spot(labels)
+            if spot_index is None:
+                print("[AutoPark] All spots are full.")
+                return
+
+            print(f"[AutoPark] Selected empty spot {spot_index}. Starting parking maneuver.")
+            self._park_in_spot(spot_index)
+
+        except KeyboardInterrupt:
+            print("[AutoPark] Interrupted by user.")
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        print("[AutoPark] Cleanup.")
+        try:
+            self.stop()
+            if self.ultra is not None and hasattr(self.ultra, "close"):
+                self.ultra.close()
+            if self.camera is not None and hasattr(self.camera, "close"):
+                self.camera.close()
+            if hasattr(self.car, "close"):
+                self.car.close()
+        except Exception as e:
+            print("[AutoPark] Cleanup error:", e)
+
+
+def main():
+    controller = AutoParkController()
+    controller.run()
+
+
+if __name__ == "__main__":
+    main()
