@@ -339,10 +339,10 @@ class ManualHoldDashboard:
             self.stop()
             return
 
-        f = 'w' in self.pressed
-        b = 's' in self.pressed
-        l = 'a' in self.pressed
-        r = 'd' in self.pressed
+        f = 's' in self.pressed
+        b = 'w' in self.pressed
+        l = 'd' in self.pressed
+        r = 'a' in self.pressed
 
         if f and not b:
             if l and not r:
