@@ -2,35 +2,36 @@
 """
 autopark.py
 
-Design:
+Called from ManualHoldDashboard with:
 
-- Exactly 4 fixed parking spots visible in front of the car.
-- One trained deep learning model:
-    Input: single front image (all 4 spots visible).
-    Output: 4 x 2 logits  -> for each spot: [empty, full].
-- Runtime behavior:
-    1) Drive forward until ultrasonic distance <= APPROACH_DISTANCE.
-    2) Stop & capture ONE front image.
-    3) Use model to classify each of the 4 spots as "empty" or "full".
-    4) If all 4 are "full": print "All spots are full." and exit.
-    5) If one or more are "empty": choose one (first empty) and
-       execute a slow parking maneuver into that spot,
-       using ultrasonic to avoid collisions.
+    subprocess.Popen(["python3", "autopark.py"], cwd=script_dir)
 
-This is a scaffold:
-- You train parking_model.pt separately.
-- Movement timings MUST be tuned on your hardware.
+Flow:
+  1) Move forward/back to get ultrasonic distance between 55 and 65 cm.
+  2) Capture a frame from Camera_1 / camera_1 (front view of 3 spots).
+  3) Run CNN model (parking_model.pt) to decide which spot is empty:
+       - 0: no empty spots
+       - 1,2,3: index of empty spot (lowest-numbered empty spot)
+  4) Movement:
+       if 1: left 90°, forward 10 cm, right 90°, forward until 8 cm
+       if 2: straight forward until 8 cm
+       if 3: right 90°, forward 10 cm, left 90°, forward until 8 cm
 """
 
 import os
-import sys
 import time
-import io
-from typing import List, Optional
+import sys
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+
+# ---- Hardware modules ----
 from motor import Ordinary_Car
 
-# ---------- Ultrasonic import (support both filenames) ----------
 try:
     from ultrasonic import Ultrasonic
 except ImportError:
@@ -39,46 +40,40 @@ except ImportError:
     except ImportError:
         Ultrasonic = None
 
-# ---------- Camera ----------
 try:
-    from camera import Camera
+    from Camera_1 import Camera
 except ImportError:
-    Camera = None
-
-# ---------- PIL for image handling ----------
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
-
-# ---------- PyTorch for model ----------
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torchvision import transforms
-except ImportError:
-    torch = None
-    nn = None
-    F = None
-    transforms = None
+    try:
+        from camera_1 import Camera
+    except ImportError:
+        Camera = None
 
 
-# ============================================================
-# 4 x 2 logits model: 4 spots x {empty, full}
-# ============================================================
+# ================== CONFIG ==================
 
-class SimplePatternNetBinary(nn.Module if nn is not None else object):
+NUM_SPOTS = 3        # we have 3 parking spots
+IMAGE_SIZE = 64      # must match training
+AUTO_SPEED = 1100    # motor speed used during autopark
+
+# You will likely need to tune these two for YOUR car:
+TURN_TIME_90 = 0.7       # seconds to pivot ~90 degrees
+FORWARD_10CM_TIME = 0.4  # seconds to move ~10 cm
+
+
+# ================== MODEL ==================
+
+class SimplePatternNetBinary(nn.Module):
     """
-    Example CNN:
-    - Input: 3x64x64 full-frame image (all 4 spots visible)
-    - Output: 8 logits = 4 spots * 2 classes (empty, full)
-      Layout: [s0_empty, s0_full, s1_empty, s1_full, s2_empty, s2_full, s3_empty, s3_full]
+    Same architecture as in train_parking_model_3spots.py
+
+    Input : 3x64x64 image (all 3 spots visible)
+    Output: 6 logits:
+        [s0_empty, s0_full,
+         s1_empty, s1_full,
+         s2_empty, s2_full]
     """
 
-    def __init__(self, num_spots: int = 4, num_classes: int = 2):
-        if nn is None:
-            return
+    def __init__(self, num_spots: int = NUM_SPOTS, num_classes: int = 2):
         super().__init__()
         self.num_spots = num_spots
         self.num_classes = num_classes
@@ -86,331 +81,296 @@ class SimplePatternNetBinary(nn.Module if nn is not None else object):
         self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
         self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
+
+        # 64x64 -> two pools -> 16x16
         self.fc1 = nn.Linear(32 * 16 * 16, 128)
-        self.fc2 = nn.Linear(128, num_spots * num_classes)  # 8 logits
+        self.fc2 = nn.Linear(128, num_spots * num_classes)
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))   # (B,16,32,32)
         x = self.pool(F.relu(self.conv2(x)))   # (B,32,16,16)
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
-        x = self.fc2(x)                        # (B, 8)
+        x = self.fc2(x)                        # (B, 6)
         return x
 
 
-class ParkingPatternModelBinary:
+inference_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor()
+])
+
+
+def load_model(device=None):
+    if device is None:
+        device = torch.device("cpu")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(script_dir, "parking_model.pt")
+
+    if not os.path.exists(model_path):
+        print(f"[ERROR] parking_model.pt not found at {model_path}")
+        sys.exit(1)
+
+    model = SimplePatternNetBinary(num_spots=NUM_SPOTS)
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+
+    print(f"[OK] Loaded model from {model_path} on {device}")
+    return model, device
+
+
+def predict_empty_spot_from_frame(frame_rgb, model, device):
     """
-    Wraps the trained 4x2 model.
+    frame_rgb: numpy array (H,W,3) in RGB from Camera.get_frame()
 
-    - Expects 'parking_model.pt' in same folder.
-    - Outputs 4 labels: "empty" or "full".
-    - Each spot is classified independently:
-        logits -> reshape (4,2) -> softmax per spot.
+    Returns:
+        0  -> no empty spot
+        1,2,3 -> index of empty spot (lowest-numbered empty spot)
     """
+    if frame_rgb is None:
+        print("[ERROR] predict_empty_spot_from_frame: frame is None")
+        return 0
 
-    LABELS = ["empty", "full"]  # index 0 = empty, 1 = full
+    # Ensure it's uint8 numpy array
+    frame_rgb = np.asarray(frame_rgb)
 
-    def __init__(self, model_path: str = "parking_model.pt"):
-        self.model_path = model_path
+    pil_img = Image.fromarray(frame_rgb)
+    x = inference_transform(pil_img).unsqueeze(0).to(device)  # (1,3,H,W)
 
-        self.enabled = (
-            torch is not None
-            and nn is not None
-            and transforms is not None
-            and os.path.exists(self.model_path)
-        )
+    with torch.no_grad():
+        logits = model(x)                      # (1, NUM_SPOTS*2)
+        logits = logits.view(1, NUM_SPOTS, 2)  # (1, spots, classes)
+        preds = torch.argmax(logits, dim=-1)   # (1, spots)
+        preds = preds.cpu().numpy()[0]         # shape (NUM_SPOTS,)
 
-        if not self.enabled:
-            print("[ParkingModel] Deep learning disabled (no torch/model). "
-                  "All spots will be treated as full.")
-            self.model = None
-            return
+    # preds[i] == 0 -> spot i is predicted empty
+    empty_indices = [i for i, c in enumerate(preds) if c == 0]
 
-        self.device = torch.device("cpu")
-        self.num_spots = 4
-        self.num_classes = 2
+    print(f"[DEBUG] per-spot predicted classes (0=empty,1=full): {preds}")
+    print(f"[DEBUG] empty spots (0-based): {empty_indices}")
 
-        self.model = SimplePatternNetBinary(
-            num_spots=self.num_spots,
-            num_classes=self.num_classes
-        ).to(self.device)
+    if not empty_indices:
+        return 0  # no empty spot
 
-        try:
-            state = torch.load(self.model_path, map_location=self.device)
-            self.model.load_state_dict(state)
-            self.model.eval()
-            print("[ParkingModel] Loaded model from", self.model_path)
-        except Exception as e:
-            print("[ParkingModel] Failed to load model:", e)
-            self.model = None
-            self.enabled = False
-
-        self.transform = transforms.Compose([
-            transforms.Resize((64, 64)),
-            transforms.ToTensor()
-        ])
-
-    def predict_all(self, image: Optional[Image.Image]) -> List[str]:
-        """
-        Return list of 4 strings: each "empty" or "full".
-        If disabled or no image -> all "full" (safe).
-        """
-        if not self.enabled or self.model is None or image is None:
-            return ["full"] * 4
-
-        x = self.transform(image.convert("RGB")).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            logits = self.model(x)           # shape: (1, 8)
-            logits = logits.view(4, 2)       # (spots, classes)
-            probs = torch.softmax(logits, dim=1)
-
-        labels = []
-        for i in range(4):
-            idx = int(torch.argmax(probs[i]).item())  # 0 or 1
-            labels.append(self.LABELS[idx])
-
-        print("[ParkingModel] Spot labels:", labels)
-        return labels
+    # Choose the lowest-numbered spot (1-based)
+    best_spot = empty_indices[0] + 1
+    return best_spot
 
 
-# ============================================================
-# Auto Park Controller
-# ============================================================
+# ================== MOVEMENT HELPERS ==================
 
-class AutoParkController:
-    def __init__(self):
-        self.car = Ordinary_Car()
+def stop_car(car: Ordinary_Car):
+    car.set_motor_model(0, 0, 0, 0)
 
-        # Ultrasonic
-        self.ultra = Ultrasonic() if Ultrasonic is not None else None
-        if self.ultra is None:
-            print("[AutoPark] WARNING: Ultrasonic missing. Autopark unsafe.")
 
-        # Camera
-        self.camera = Camera() if Camera is not None else None
-        if self.camera is None:
-            print("[AutoPark] WARNING: Camera missing. Autopark disabled.")
+def drive_forward(car: Ordinary_Car, speed=AUTO_SPEED):
+    # Same direction as your manual FORWARD
+    car.set_motor_model(speed, speed, speed, speed)
 
-        # Model
-        self.model = ParkingPatternModelBinary()
 
-        # ---- Tunable parameters ----
-        self.APPROACH_DISTANCE = 40.0   # cm from row where we scan
-        self.FORWARD_SPEED = 900
-        self.PARK_SPEED = 600
-        self.TURN_SPEED = 800
+def drive_backward(car: Ordinary_Car, speed=AUTO_SPEED):
+    car.set_motor_model(-speed, -speed, -speed, -speed)
 
-        self.MIN_FRONT_DIST_CM = 8.0    # hard stop if closer than this
 
-    # ---------- Utilities ----------
+def turn_left_90(car: Ordinary_Car, speed=AUTO_SPEED):
+    """
+    Pivot left ~90 degrees.
+    Same pattern as LEFT PIVOT in your dashboard:
+        self.car.set_motor_model(-s, -s, s, s)
+    """
+    print("[ACTION] turn left 90°")
+    car.set_motor_model(-speed, -speed, speed, speed)
+    time.sleep(TURN_TIME_90)
+    stop_car(car)
 
-    def stop(self):
-        self.car.set_motor_model(0, 0, 0, 0)
 
-    def _read_distance(self) -> Optional[float]:
-        if self.ultra is None:
-            return None
-        try:
-            return self.ultra.get_distance()
-        except Exception:
-            return None
+def turn_right_90(car: Ordinary_Car, speed=AUTO_SPEED):
+    """
+    Pivot right ~90 degrees.
+    Same pattern as RIGHT PIVOT:
+        self.car.set_motor_model(s, s, -s, -s)
+    """
+    print("[ACTION] turn right 90°")
+    car.set_motor_model(speed, speed, -speed, -speed)
+    time.sleep(TURN_TIME_90)
+    stop_car(car)
 
-    def _too_close_front(self) -> bool:
-        d = self._read_distance()
-        if d is not None and d < self.MIN_FRONT_DIST_CM:
-            print(f"[AutoPark] FRONT TOO CLOSE: {d:.1f} cm -> STOP")
-            self.stop()
+
+def drive_forward_10cm(car: Ordinary_Car, speed=AUTO_SPEED):
+    """
+    Drive forward for a time that corresponds to ~10 cm.
+    You may need to tune FORWARD_10CM_TIME.
+    """
+    print("[ACTION] drive forward ~10 cm")
+    car.set_motor_model(speed, speed, speed, speed)
+    time.sleep(FORWARD_10CM_TIME)
+    stop_car(car)
+
+
+def drive_until_distance(car: Ordinary_Car, ultrasonic: Ultrasonic,
+                         target_cm: float, speed=AUTO_SPEED,
+                         max_time: float = 10.0):
+    """
+    Drive forward until ultrasonic distance <= target_cm or timeout.
+    """
+    print(f"[INFO] drive forward until distance <= {target_cm} cm")
+    t0 = time.time()
+    while time.time() - t0 < max_time:
+        d = ultrasonic.get_distance()
+        if d is None:
+            print("[WARN] distance is None, retrying...")
+            time.sleep(0.05)
+            continue
+
+        print(f"[DEBUG] distance={d:.1f} cm")
+        if d <= target_cm:
+            print("[INFO] reached target distance")
+            break
+
+        drive_forward(car, speed)
+        time.sleep(0.05)
+
+    stop_car(car)
+
+
+def move_to_distance_range(car: Ordinary_Car, ultrasonic: Ultrasonic,
+                           dist_min: float, dist_max: float,
+                           speed=AUTO_SPEED, max_time: float = 15.0):
+    """
+    Adjust car so that ultrasonic distance is between dist_min and dist_max.
+
+    Simple strategy:
+      - If distance > dist_max: drive forward
+      - If distance < dist_min: drive backward
+      - When in range: stop and return True
+      - If timeout: stop and return False
+    """
+    print(f"[INFO] Adjusting distance to be between {dist_min} and {dist_max} cm")
+    t0 = time.time()
+    while time.time() - t0 < max_time:
+        d = ultrasonic.get_distance()
+        if d is None:
+            print("[WARN] distance is None, retrying...")
+            time.sleep(0.05)
+            continue
+
+        print(f"[DEBUG] current distance: {d:.1f} cm")
+
+        if dist_min <= d <= dist_max:
+            print("[INFO] distance in target range, stopping.")
+            stop_car(car)
             return True
-        return False
+        elif d > dist_max:
+            # Too far: move forward
+            drive_forward(car, speed)
+        else:
+            # Too close: move backward
+            drive_backward(car, speed)
 
-    def drive_forward_until(self, target_cm: float, timeout: float = 6.0):
-        """
-        Drive forward until ultrasonic <= target_cm or timeout.
-        """
-        self.car.set_motor_model(
-            self.FORWARD_SPEED, self.FORWARD_SPEED,
-            self.FORWARD_SPEED, self.FORWARD_SPEED
-        )
-        start = time.time()
-        while time.time() - start < timeout:
-            if self._too_close_front():
-                break
-            d = self._read_distance()
-            if d is not None and d <= target_cm:
-                break
-            time.sleep(0.02)
-        self.stop()
+        time.sleep(0.05)
 
-    # ---------- Camera capture ----------
+    print("[WARN] move_to_distance_range: timeout reached.")
+    stop_car(car)
+    return False
 
-    def _capture_frame(self) -> Optional[Image.Image]:
-        if self.camera is None or Image is None:
-            return None
-        try:
-            # lazy-start streaming once
-            if not getattr(self.camera, "_ap_streaming", False):
-                if hasattr(self.camera, "start_stream"):
-                    self.camera.start_stream()
-                setattr(self.camera, "_ap_streaming", True)
-                time.sleep(0.5)
 
-            frame = self.camera.get_frame() if hasattr(self.camera, "get_frame") else None
-            if not frame:
-                return None
-
-            return Image.open(io.BytesIO(frame)).convert("RGB")
-        except Exception as e:
-            print("[AutoPark] Error capturing frame:", e)
-            return None
-
-    def scan_spots(self) -> List[str]:
-        """
-        Capture one frame and classify 4 spots.
-        """
-        img = self._capture_frame()
-        if img is None:
-            print("[AutoPark] No frame captured; assuming all full.")
-            return ["full"] * 4
-        labels = self.model.predict_all(img)
-        return labels
-
-    # ---------- Spot selection & parking maneuver ----------
-
-    def _choose_spot(self, labels: List[str]) -> Optional[int]:
-        """
-        Choose the spot to park in.
-        Strategy: pick the first "empty" spot.
-        """
-        for i, lab in enumerate(labels):
-            if lab == "empty":
-                return i
-        return None
-
-    def _park_in_spot(self, index: int):
-        """
-        Simple scripted maneuver into chosen spot.
-
-        Assumes:
-        - Spots are laid out horizontally from left to right in the camera view.
-        - Car is centered in lane facing them.
-        - Spots are on the RIGHT side relative to car motion (tweak if needed).
-
-        You MUST tune these durations for your geometry.
-        """
-
-        print(f"[AutoPark] Parking into spot {index}")
-
-        # Step 1: slight forward adjustment based on which bay
-        base_time = 0.3
-        extra_per_spot = 0.25
-        forward_time = base_time + extra_per_spot * index
-
-        print(f"[AutoPark] Forward adjust: {forward_time:.2f}s")
-        self.car.set_motor_model(
-            self.PARK_SPEED, self.PARK_SPEED,
-            self.PARK_SPEED, self.PARK_SPEED
-        )
-        start = time.time()
-        while time.time() - start < forward_time:
-            if self._too_close_front():
-                break
-            time.sleep(0.02)
-        self.stop()
-
-        # Step 2: right-turn arc into the bay
-        # Slow right wheels, faster left wheels -> curve to right.
-        print("[AutoPark] Turning into bay...")
-        turn_time = 2.0  # tune per spot/geometry
-        start = time.time()
-        while time.time() - start < turn_time:
-            if self._too_close_front():
-                break
-            self.car.set_motor_model(
-                self.PARK_SPEED, self.PARK_SPEED,
-                int(0.5 * self.PARK_SPEED), int(0.5 * self.PARK_SPEED)
-            )
-            time.sleep(0.05)
-        self.stop()
-
-        # Step 3: final slow creep until near obstacle
-        print("[AutoPark] Final creep forward...")
-        max_creep = 3.0
-        start = time.time()
-        while time.time() - start < max_creep:
-            d = self._read_distance()
-            if d is not None and d <= self.MIN_FRONT_DIST_CM:
-                print(f"[AutoPark] Stop at front distance {d:.1f} cm")
-                break
-            self.car.set_motor_model(
-                self.PARK_SPEED, self.PARK_SPEED,
-                self.PARK_SPEED, self.PARK_SPEED
-            )
-            time.sleep(0.05)
-        self.stop()
-
-        print("[AutoPark] Parking complete (scripted).")
-
-    # ---------- Main run ----------
-
-    def run(self):
-        print("[AutoPark] Auto-park started.")
-
-        # Pre-flight checks
-        if self.ultra is None:
-            print("[AutoPark] ERROR: No ultrasonic. Aborting.")
-            self.cleanup()
-            return
-
-        if self.camera is None or not self.model.enabled or self.model.model is None:
-            print("[AutoPark] ERROR: Camera or model not ready. Aborting.")
-            self.cleanup()
-            return
-
-        try:
-            # 1) Drive to scan distance
-            print("[AutoPark] Approaching scan distance...")
-            self.drive_forward_until(self.APPROACH_DISTANCE)
-
-            if self._too_close_front():
-                print("[AutoPark] Too close before scan; abort.")
-                return
-
-            # 2) One scan of all 4 spots
-            labels = self.scan_spots()
-            print("[AutoPark] Spot labels:", labels)
-
-            # 3) Check if any empty
-            spot_index = self._choose_spot(labels)
-            if spot_index is None:
-                print("[AutoPark] All spots are full.")
-                return
-
-            print(f"[AutoPark] Selected empty spot {spot_index}. Starting parking maneuver.")
-            self._park_in_spot(spot_index)
-
-        except KeyboardInterrupt:
-            print("[AutoPark] Interrupted by user.")
-        finally:
-            self.cleanup()
-
-    def cleanup(self):
-        print("[AutoPark] Cleanup.")
-        try:
-            self.stop()
-            if self.ultra is not None and hasattr(self.ultra, "close"):
-                self.ultra.close()
-            if self.camera is not None and hasattr(self.camera, "close"):
-                self.camera.close()
-            if hasattr(self.car, "close"):
-                self.car.close()
-        except Exception as e:
-            print("[AutoPark] Cleanup error:", e)
-
+# ================== MAIN AUTOPARK LOGIC ==================
 
 def main():
-    controller = AutoParkController()
-    controller.run()
+    if Ultrasonic is None:
+        print("[ERROR] Ultrasonic module not found.")
+        sys.exit(1)
+    if Camera is None:
+        print("[ERROR] Camera module (Camera_1.py / camera_1.py) not found.")
+        sys.exit(1)
+
+    car = Ordinary_Car()
+    ultrasonic = None
+    camera = None
+
+    try:
+        # Init sensors
+        ultrasonic = Ultrasonic()
+        camera = Camera()
+        camera.start_stream()
+        time.sleep(0.5)  # small delay so camera has good frame
+
+        model, device = load_model()
+
+        # 1) Move to 55–65 cm from obstacle
+        ok = move_to_distance_range(car, ultrasonic, 55.0, 65.0,
+                                    speed=AUTO_SPEED, max_time=20.0)
+        if not ok:
+            print("[ERROR] Could not reach target distance range. Aborting autopark.")
+            return
+
+        # 2) Capture frame
+        time.sleep(0.5)  # small pause to let the car stabilize
+        frame = camera.get_frame()
+        if frame is None:
+            print("[ERROR] Could not get frame from camera. Aborting autopark.")
+            return
+
+        # 3) Predict empty spot (1,2,3) or 0 if none
+        spot = predict_empty_spot_from_frame(frame, model, device)
+        print(f"[INFO] predicted empty spot: {spot}")
+
+        if spot == 0:
+            print("[INFO] No empty spot detected. Autopark aborted.")
+            return
+
+        # 4) Movement according to spot
+        if spot == 1:
+            print("[INFO] Parking in spot 1 (left)")
+            turn_left_90(car, AUTO_SPEED)
+            drive_forward_10cm(car, AUTO_SPEED)
+            turn_right_90(car, AUTO_SPEED)
+            drive_until_distance(car, ultrasonic, target_cm=8.0,
+                                 speed=AUTO_SPEED, max_time=10.0)
+
+        elif spot == 2:
+            print("[INFO] Parking in spot 2 (middle)")
+            drive_until_distance(car, ultrasonic, target_cm=8.0,
+                                 speed=AUTO_SPEED, max_time=10.0)
+
+        elif spot == 3:
+            print("[INFO] Parking in spot 3 (right)")
+            turn_right_90(car, AUTO_SPEED)
+            drive_forward_10cm(car, AUTO_SPEED)
+            turn_left_90(car, AUTO_SPEED)
+            drive_until_distance(car, ultrasonic, target_cm=8.0,
+                                 speed=AUTO_SPEED, max_time=10.0)
+
+        stop_car(car)
+        print("[OK] Autopark sequence completed.")
+
+    except KeyboardInterrupt:
+        print("\n[INFO] KeyboardInterrupt: stopping autopark.")
+
+    finally:
+        # cleanup
+        try:
+            stop_car(car)
+        except Exception:
+            pass
+
+        if ultrasonic is not None and hasattr(ultrasonic, "close"):
+            try:
+                ultrasonic.close()
+            except Exception:
+                pass
+
+        if camera is not None:
+            try:
+                if hasattr(camera, "stop_stream"):
+                    camera.stop_stream()
+                if hasattr(camera, "close"):
+                    camera.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
