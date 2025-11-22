@@ -13,9 +13,11 @@ Flow:
        - 0: no empty spots
        - 1,2,3: index of empty spot (lowest-numbered empty spot)
   4) Movement:
-       if 1: left 90°, forward 10 cm, right 90°, forward until 8 cm
+       if 1: left 90° (like 'A' for TURN_TIME_90), forward 10 cm (like 'W'),
+             right 90° (like 'D'), then forward until 8 cm
        if 2: straight forward until 8 cm
-       if 3: right 90°, forward 10 cm, left 90°, forward until 8 cm
+       if 3: right 90° (like 'D'), forward 10 cm (like 'W'),
+             left 90° (like 'A'), then forward until 8 cm
 """
 
 import os
@@ -55,9 +57,9 @@ NUM_SPOTS = 3        # we have 3 parking spots
 IMAGE_SIZE = 64      # must match training
 AUTO_SPEED = 1100    # motor speed used during autopark
 
-# You will likely need to tune these two for YOUR car:
-TURN_TIME_90 = 0.7       # seconds to pivot ~90 degrees
-FORWARD_10CM_TIME = 0.4  # seconds to move ~10 cm
+# Here you "hold the key" for this long:
+TURN_TIME_90 = 1.5        # seconds to pivot ~90 degrees (like holding A/D)
+FORWARD_10CM_TIME = 0.4   # seconds to move ~10 cm (like holding W)
 
 
 # ================== MODEL ==================
@@ -134,9 +136,7 @@ def predict_empty_spot_from_frame(frame_rgb, model, device):
         print("[ERROR] predict_empty_spot_from_frame: frame is None")
         return 0
 
-    # Ensure it's uint8 numpy array
     frame_rgb = np.asarray(frame_rgb)
-
     pil_img = Image.fromarray(frame_rgb)
     x = inference_transform(pil_img).unsqueeze(0).to(device)  # (1,3,H,W)
 
@@ -146,17 +146,15 @@ def predict_empty_spot_from_frame(frame_rgb, model, device):
         preds = torch.argmax(logits, dim=-1)   # (1, spots)
         preds = preds.cpu().numpy()[0]         # shape (NUM_SPOTS,)
 
-    # preds[i] == 0 -> spot i is predicted empty
     empty_indices = [i for i, c in enumerate(preds) if c == 0]
 
     print(f"[DEBUG] per-spot predicted classes (0=empty,1=full): {preds}")
     print(f"[DEBUG] empty spots (0-based): {empty_indices}")
 
     if not empty_indices:
-        return 0  # no empty spot
+        return 0
 
-    # Choose the lowest-numbered spot (1-based)
-    best_spot = empty_indices[0] + 1
+    best_spot = empty_indices[0] + 1  # 1-based
     return best_spot
 
 
@@ -167,21 +165,25 @@ def stop_car(car: Ordinary_Car):
 
 
 def drive_forward(car: Ordinary_Car, speed=AUTO_SPEED):
-    # Same direction as your manual FORWARD
+    """
+    Equivalent to "holding W" in the dashboard (forward).
+    """
     car.set_motor_model(speed, speed, speed, speed)
 
 
 def drive_backward(car: Ordinary_Car, speed=AUTO_SPEED):
+    """
+    Equivalent to "holding S" in the dashboard (backward).
+    """
     car.set_motor_model(-speed, -speed, -speed, -speed)
 
 
 def turn_left_90(car: Ordinary_Car, speed=AUTO_SPEED):
     """
-    Pivot left ~90 degrees.
-    Same pattern as LEFT PIVOT in your dashboard:
-        self.car.set_motor_model(-s, -s, s, s)
+    Equivalent to "holding A" (left turn) for TURN_TIME_90 seconds:
+      left pivot: (-,+) pattern -> (-s, -s, +s, +s)
     """
-    print("[ACTION] turn left 90°")
+    print(f"[ACTION] 'A' (left) for {TURN_TIME_90:.2f} s")
     car.set_motor_model(-speed, -speed, speed, speed)
     time.sleep(TURN_TIME_90)
     stop_car(car)
@@ -189,11 +191,10 @@ def turn_left_90(car: Ordinary_Car, speed=AUTO_SPEED):
 
 def turn_right_90(car: Ordinary_Car, speed=AUTO_SPEED):
     """
-    Pivot right ~90 degrees.
-    Same pattern as RIGHT PIVOT:
-        self.car.set_motor_model(s, s, -s, -s)
+    Equivalent to "holding D" (right turn) for TURN_TIME_90 seconds:
+      right pivot: (+,-) pattern -> (+s, +s, -s, -s)
     """
-    print("[ACTION] turn right 90°")
+    print(f"[ACTION] 'D' (right) for {TURN_TIME_90:.2f} s")
     car.set_motor_model(speed, speed, -speed, -speed)
     time.sleep(TURN_TIME_90)
     stop_car(car)
@@ -201,10 +202,10 @@ def turn_right_90(car: Ordinary_Car, speed=AUTO_SPEED):
 
 def drive_forward_10cm(car: Ordinary_Car, speed=AUTO_SPEED):
     """
-    Drive forward for a time that corresponds to ~10 cm.
-    You may need to tune FORWARD_10CM_TIME.
+    Equivalent to "holding W" (forward) for FORWARD_10CM_TIME seconds.
+    You might need to tune this time to get ~10 cm.
     """
-    print("[ACTION] drive forward ~10 cm")
+    print(f"[ACTION] 'W' (forward) for {FORWARD_10CM_TIME:.2f} s (~10 cm)")
     car.set_motor_model(speed, speed, speed, speed)
     time.sleep(FORWARD_10CM_TIME)
     stop_car(car)
@@ -215,6 +216,7 @@ def drive_until_distance(car: Ordinary_Car, ultrasonic: Ultrasonic,
                          max_time: float = 10.0):
     """
     Drive forward until ultrasonic distance <= target_cm or timeout.
+    This is like "holding W" but with feedback from the sensor.
     """
     print(f"[INFO] drive forward until distance <= {target_cm} cm")
     t0 = time.time()
@@ -242,11 +244,9 @@ def move_to_distance_range(car: Ordinary_Car, ultrasonic: Ultrasonic,
     """
     Adjust car so that ultrasonic distance is between dist_min and dist_max.
 
-    Simple strategy:
-      - If distance > dist_max: drive forward
-      - If distance < dist_min: drive backward
-      - When in range: stop and return True
-      - If timeout: stop and return False
+    Similar idea to tapping W/S manually:
+      - If distance > dist_max: go forward (W)
+      - If distance < dist_min: go backward (S)
     """
     print(f"[INFO] Adjusting distance to be between {dist_min} and {dist_max} cm")
     t0 = time.time()
@@ -264,10 +264,8 @@ def move_to_distance_range(car: Ordinary_Car, ultrasonic: Ultrasonic,
             stop_car(car)
             return True
         elif d > dist_max:
-            # Too far: move forward
             drive_forward(car, speed)
         else:
-            # Too close: move backward
             drive_backward(car, speed)
 
         time.sleep(0.05)
@@ -325,9 +323,9 @@ def main():
         # 4) Movement according to spot
         if spot == 1:
             print("[INFO] Parking in spot 1 (left)")
-            turn_left_90(car, AUTO_SPEED)
-            drive_forward_10cm(car, AUTO_SPEED)
-            turn_right_90(car, AUTO_SPEED)
+            turn_left_90(car, AUTO_SPEED)             # A for TURN_TIME_90
+            drive_forward_10cm(car, AUTO_SPEED)       # W for FORWARD_10CM_TIME
+            turn_right_90(car, AUTO_SPEED)            # D for TURN_TIME_90
             drive_until_distance(car, ultrasonic, target_cm=8.0,
                                  speed=AUTO_SPEED, max_time=10.0)
 
@@ -338,9 +336,9 @@ def main():
 
         elif spot == 3:
             print("[INFO] Parking in spot 3 (right)")
-            turn_right_90(car, AUTO_SPEED)
-            drive_forward_10cm(car, AUTO_SPEED)
-            turn_left_90(car, AUTO_SPEED)
+            turn_right_90(car, AUTO_SPEED)            # D for TURN_TIME_90
+            drive_forward_10cm(car, AUTO_SPEED)       # W for FORWARD_10CM_TIME
+            turn_left_90(car, AUTO_SPEED)             # A for TURN_TIME_90
             drive_until_distance(car, ultrasonic, target_cm=8.0,
                                  speed=AUTO_SPEED, max_time=10.0)
 
